@@ -7,6 +7,9 @@
 #define MAX_LEN   1000
 #define MAX_EQU   100
 
+void runSimulator(const char *objFile);
+void generateObj(const char *preFile);
+
 //auxiliar
 int endsWith(const char *str, const char *ext) {
     int ls = strlen(str), le = strlen(ext);
@@ -123,7 +126,7 @@ int findInst(const char *n) {
 //  TABELA DE SÍMBOLOS
 
 
-typedef struct { char name[50]; int addr; } Symbol;
+typedef struct { char name[50]; int value; int defined; int list_head; } Symbol;
 Symbol symTable[500];
 int    symCount = 0;
 
@@ -133,9 +136,21 @@ int findSym(const char *n) {
     return -1;
 }
 
+int getOrCreateSym(const char *n) {
+    int idx = findSym(n);
+    if (idx != -1) return idx;
+    
+    strcpy(symTable[symCount].name, n);
+    symTable[symCount].value = -1;
+    symTable[symCount].defined = 0;
+    symTable[symCount].list_head = -1; // -1 indica fim da lista
+    symCount++;
+    return symCount - 1;
+}
+
 void addSym(const char *n, int addr) {
     strcpy(symTable[symCount].name, n);
-    symTable[symCount].addr = addr;
+    symTable[symCount].value = addr;
     symCount++;
 }
 
@@ -233,9 +248,15 @@ void normalizeLines(char raw[][MAX_LEN], int rawCount,
             skipping = (val == NULL || strcmp(val, "0") == 0) ? 1 : 0;
             continue;
         }
-        if (strcmp(t1, "ENDIF") == 0) { skipping = 0; continue; }
-        if (!skipping)
-            strcpy(afterIf[afterIfCount++], afterEqu[i]);
+        
+        // Se a flag estiver ativada (1)
+        if (skipping) {
+            skipping = 0; // "Desliga" o pulo para que a próxima linha seja salva normalmente
+            continue;
+        }
+
+        // Se chegou aqui e não estava pulando, salva a linha
+        strcpy(afterIf[afterIfCount++], afterEqu[i]);
     }
 
     //substituir aliases EQU
@@ -341,33 +362,11 @@ void preprocess(const char *file) {
     printf("Pré-processamento concluído: %s\n", outName);
 }
 
-// passagem unica
 
-
+// passagem unica com lista encadeada
 void onePass(const char *preFile) {
     FILE *f = fopen(preFile, "r");
     if (!f) { printf("Erro ao abrir .pre\n"); exit(1); }
-
-    char line[MAX_LEN];
-    int  LC = 0;
-    while (fgets(line, MAX_LEN, f)) {
-        line[strcspn(line, "\n")] = '\0';
-        if (isEmpty(line)) continue;
-        char label[50], op[50], arg1[50], arg2[50];
-        parseLine(line, label, op, arg1, arg2);
-
-        if (label[0]) {
-            if (findSym(label) == -1) addSym(label, LC);
-        }
-        int idx = findInst(op);
-        if (idx != -1)               LC += inst[idx].size;
-        else if (strcmp(op, "SPACE") == 0) {
-            int n = arg1[0] ? atoi(arg1) : 1;
-            LC += (n < 1) ? 1 : n;
-        }
-        else if (strcmp(op, "CONST") == 0) LC += 1;
-    }
-    fclose(f);
 
     char penName[MAX_LEN];
     strcpy(penName, preFile);
@@ -375,37 +374,52 @@ void onePass(const char *preFile) {
     if (dot) *dot = '\0';
     strcat(penName, ".pen");
 
-    f = fopen(preFile, "r");
     FILE *o = fopen(penName, "w");
-    if (!f || !o) { printf("Erro ao criar .pen\n"); exit(1); }
+    if (!o) { printf("Erro ao criar .pen\n"); exit(1); }
 
-    LC = 0;
+    int LC = 0;
+    char line[MAX_LEN];
+    
+    symCount = 0;
+
     while (fgets(line, MAX_LEN, f)) {
         line[strcspn(line, "\n")] = '\0';
         if (isEmpty(line)) continue;
+
         char label[50], op[50], arg1[50], arg2[50];
         parseLine(line, label, op, arg1, arg2);
+
+        // Se tem rótulo, define o símbolo
+        if (label[0]) {
+            int s = getOrCreateSym(label);
+            symTable[s].value = LC;
+            symTable[s].defined = 1;
+        }
 
         int idx = findInst(op);
         if (idx != -1) {
             fprintf(o, "%d ", inst[idx].opcode);
 
             if (inst[idx].size >= 2) {
-                int s = findSym(arg1);
-                if (s == -1 || symTable[s].addr > LC)
-                    fprintf(o, "-1 ");
-                else
-                    fprintf(o, "%d ", symTable[s].addr);
+                int s = getOrCreateSym(arg1);
+                if (symTable[s].defined) {
+                    fprintf(o, "%d ", symTable[s].value);
+                } else {
+                    fprintf(o, "%d ", symTable[s].list_head);
+                    symTable[s].list_head = LC + 1; // Guarda a posição da pendência
+                }
             }
             if (inst[idx].size == 3) {
-                int s = findSym(arg2);
-                if (s == -1 || symTable[s].addr > LC)
-                    fprintf(o, "-1 ");
-                else
-                    fprintf(o, "%d ", symTable[s].addr);
+                int s = getOrCreateSym(arg2);
+                if (symTable[s].defined) {
+                    fprintf(o, "%d ", symTable[s].value);
+                } else {
+                    fprintf(o, "%d ", symTable[s].list_head);
+                    symTable[s].list_head = LC + 2; // Guarda a posição da pendência
+                }
             }
             LC += inst[idx].size;
-
+            
         } else if (strcmp(op, "CONST") == 0) {
             int v = 0;
             if (strncmp(arg1, "0X", 2) == 0 || strncmp(arg1, "-0X", 3) == 0)
@@ -428,11 +442,166 @@ void onePass(const char *preFile) {
     printf(".pen gerado: %s\n", penName);
 }
 
+// Generate .obj
+void generateObj(const char *preFile) {
+    char penName[MAX_LEN];
+    strcpy(penName, preFile);
+    char *dot = strrchr(penName, '.');
+    if (dot) *dot = '\0';
+    strcat(penName, ".pen");
+
+    FILE *f = fopen(penName, "r");
+    if (!f) {
+        printf("Erro ao abrir %s para geracao do .obj\n", penName);
+        exit(1);
+    }
+
+   
+    int code[5000];
+    int codeSize = 0;
+    while (fscanf(f, "%d", &code[codeSize]) == 1) {
+        codeSize++;
+    }
+    fclose(f);
+
+    // Resolve as pendências
+    for (int i = 0; i < symCount; i++) {
+        if (!symTable[i].defined) {
+            printf("ERRO: Símbolo '%s' foi usado mas nunca definido!\n", symTable[i].name);
+            exit(1);
+        }
+        
+        int curr = symTable[i].list_head;
+        while (curr != -1) {
+            int next = code[curr];         
+            code[curr] = symTable[i].value; 
+            curr = next;                    
+        }
+    }
+
+    // .obj 
+    char objName[MAX_LEN];
+    strcpy(objName, preFile);
+    dot = strrchr(objName, '.');
+    if (dot) *dot = '\0';
+    strcat(objName, ".obj");
+
+    FILE *o = fopen(objName, "w");
+    if (!o) {
+        printf("Erro ao criar .obj\n");
+        exit(1);
+    }
+
+    for (int i = 0; i < codeSize; i++) {
+        if (i > 0) fprintf(o, " ");
+        fprintf(o, "%d", code[i]);
+    }
+
+    fclose(o);
+    printf(".obj gerado com sucesso: %s\n", objName);
+}
+
+void runSimulator(const char *objFile) {
+    FILE *f = fopen(objFile, "r");
+    if (!f) {
+        printf("Erro ao abrir ficheiro .obj\n");
+        exit(1);
+    }
+
+    int memoria[5000];
+    int memSize = 0;
+    
+    while (fscanf(f, "%d", &memoria[memSize]) == 1) {
+        memSize++;
+    }
+    fclose(f);
+
+    int ACC = 0;
+    int PC = 0;
+    int rodando = 1;
+
+    while (rodando && PC < memSize) {
+        int opcode = memoria[PC];
+
+        switch (opcode) {
+            case 1: // ADD: ACC = ACC + memory[memory[PC+1]]
+                ACC += memoria[memoria[PC + 1]];
+                PC += 2;
+                break;
+            case 2: // SUB: ACC = ACC - memory[memory[PC+1]]
+                ACC -= memoria[memoria[PC + 1]];
+                PC += 2;
+                break;
+            case 3: // MULT: ACC = ACC * memory[memory[PC+1]]
+                ACC *= memoria[memoria[PC + 1]];
+                PC += 2;
+                break;
+            case 4: // DIV: ACC = ACC / memory[memory[PC+1]]
+                if (memoria[memoria[PC + 1]] == 0) {
+                    printf("Erro: Divisao por zero!\n");
+                    rodando = 0;
+                } else {
+                    ACC /= memoria[memoria[PC + 1]];
+                    PC += 2;
+                }
+                break;
+            case 5: // JMP: PC = memory[PC+1] 
+                PC = memoria[PC + 1];
+                break;
+            case 6: // JMPN: pula se ACC < 0
+                if (ACC < 0) PC = memoria[PC + 1];
+                else PC += 2;
+                break;
+            case 7: // JMPP: pula se ACC > 0
+                if (ACC > 0) PC = memoria[PC + 1];
+                else PC += 2;
+                break;
+            case 8: // JMPZ: pula se ACC == 0
+                if (ACC == 0) PC = memoria[PC + 1];
+                else PC += 2;
+                break;
+            case 9: // COPY: memory[memory[PC+2]] = memory[memory[PC+1]]
+                memoria[memoria[PC + 2]] = memoria[memoria[PC + 1]];
+                PC += 3;
+                break;
+            case 10: // LOAD: ACC = memory[memory[PC+1]]
+                ACC = memoria[memoria[PC + 1]];
+                PC += 2;
+                break;
+            case 11: // STORE: memory[memory[PC+1]] = ACC
+                memoria[memoria[PC + 1]] = ACC;
+                PC += 2;
+                break;
+            case 12: // INPUT: lê para memory[memory[PC+1]]
+                printf("INPUT: ");
+                fflush(stdout);
+                if (scanf("%d", &memoria[memoria[PC + 1]]) != 1) {
+                    printf("Erro na leitura de dados.\n");
+                }
+                PC += 2;
+                break;
+            case 13: // OUTPUT: imprime memory[memory[PC+1]]
+                printf("OUTPUT: %d\n", memoria[memoria[PC + 1]]);
+                PC += 2;
+                break;
+            case 14: // STOP
+                rodando = 0;
+                break;
+            default:
+                printf("Erro: Opcode desconhecido %d no endereco %d\n", opcode, PC);
+                rodando = 0;
+                break;
+        }
+    }
+    printf("Simulacao terminada com sucesso.\n");
+}
+
 int main(int argc, char *argv[]) {
     if (argc < 2) {
         printf("Uso:\n");
-        printf("  ./montador arquivo.asm   -> gera arquivo.pre\n");
-        printf("  ./montador arquivo.pre   -> gera arquivo.pen\n");
+        printf("  ./ASSEMBLER arquivo.asm   -> gera arquivo.pre\n");
+        printf("  ./ASSEMBLER arquivo.pre   -> gera arquivo.pen\n");
+        printf("  ./ASSEMBLER arquivo.obj   -> roda o simulador\n");
         return 1;
     }
 
@@ -440,8 +609,12 @@ int main(int argc, char *argv[]) {
         preprocess(argv[1]);
 
     } else if (endsWith(argv[1], ".pre")) {
+        printf("Executando Montagem Final para: %s\n", argv[1]);
         onePass(argv[1]);
-
+        generateObj(argv[1]);
+    } else if (endsWith(argv[1], ".obj")) {
+        printf("Iniciando o simulador para: %s\n", argv[1]);
+        runSimulator(argv[1]);
     } else {
         printf("Extensão inválida. Use .asm ou .pre\n");
         return 1;
